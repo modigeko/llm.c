@@ -6,18 +6,24 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <assert.h>
+#include <float.h>
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
 // CUDA utils
 
-// error checking
+// convenience macro for calculating grid/block dimensions for kernels
+#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+
+// CUDA error checking
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
@@ -26,7 +32,23 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
   }
 };
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+
+// cuBLAS error checking
+void cublasCheck(cublasStatus_t status, const char *file, int line)
+{
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
+        exit(EXIT_FAILURE);
+    }
+}
+#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
+
+// cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
+static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
+static void* cublaslt_workspace = NULL;
+static cublasComputeType_t cublas_compute_type;
+cublasHandle_t cublas_handle;
+cublasLtHandle_t cublaslt_handle;
 
 // ----------------------------------------------------------------------------
 // all the kernels
@@ -175,22 +197,6 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
     }
 }
 
-__global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
-    // scales the pre-softmax attention scores by scale
-    // and sets the autoregressive locations to -INFINITY
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < B * NH * T * T) {
-        int rest = idx % (NH * T * T);
-        rest = rest % (T * T);
-        int t2 = rest / T;
-        int t = rest % T;
-        if (t > t2) {
-            inp[idx] = -INFINITY;
-        } else {
-            inp[idx] *= scale;
-        }
-    }
-}
 
 __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
@@ -281,6 +287,71 @@ __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
     }
 }
 
+__device__ float& vec_at(float4& vec, int index) {
+    return reinterpret_cast<float*>(&vec)[index];
+}
+
+__device__ float vec_at(const float4& vec, int index) {
+    return reinterpret_cast<const float*>(&vec)[index];
+}
+
+__global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
+    assert(T % 4  == 0);
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
+
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const float* x = inp + idx * T;
+
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
+    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
+        float4 v = x_vec[i];
+        float old_maxval = maxval;
+        for(int k = 0; k < 4; ++k) {
+            maxval = fmaxf(maxval, vec_at(v, k));
+        }
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        for(int k = 0; k < 4; ++k) {
+            sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
+        }
+    }
+
+    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
+        float old_maxval = maxval;
+        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
+    }
+
+    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
+    sumval *= expf(inv_temperature * (maxval - global_maxval));
+
+    float sum = cg::reduce(warp, sumval, cg::plus<float>{});
+    float norm = 1.f / sum;
+
+    // divide the whole row by the sum
+    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
+        // recalculation is faster than doing the round-trip through memory.
+        float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
+        __stcs(out + idx * T + i, ev * norm);
+    }
+}
+
 __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
@@ -334,8 +405,8 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 1 is the most naive matmul kernel
-void matmul_forward(float* out,
+// uses cuBLAS
+void matmul_forward_cublas(float* out,
                     float* inp, float* weight, float* bias,
                     int B, int T, int C, int OC) {
     const int sqrt_block_size = 32;
@@ -344,11 +415,8 @@ void matmul_forward(float* out,
     cublasStatus_t stat = cublasCreate(&handle); // initialize CUBLAS context
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    stat = cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(1);
-    }
+    cublasCheck(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
+
     // and now we still have to add the bias... (ew)
     if (bias != NULL) {
         int block_size = sqrt_block_size * sqrt_block_size;
@@ -359,10 +427,86 @@ void matmul_forward(float* out,
     cublasDestroy(handle);
 }
 
+// uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
+// https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
+// https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
+void matmul_forward_cublaslt(float* out,
+                     float* inp, float* weight, float* bias,
+                     int B, int T, int C, int OC) {
+    int has_bias = (bias != NULL);
+
+    // check bias alignment
+    if(((uintptr_t)bias % 16) != 0) {
+        printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int returnedResults = 0;
+    cublasLtMatmulDesc_t operationDesc;
+    cublasLtMatmulPreference_t preference;
+    cublasLtMatrixLayout_t weightLayout;
+    cublasLtMatrixLayout_t inputLayout;
+    cublasLtMatrixLayout_t outputLayout;
+    cublasLtMatrixLayout_t biasLayout;
+    cublasLtMatmulHeuristicResult_t heuristic;
+
+    // create the operation descriptor
+    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
+    cublasOperation_t opTranspose = CUBLAS_OP_T;
+    cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_BIAS;
+    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+
+    // define matrix layouts
+    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, C, OC, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, C, B*T, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUDA_R_32F, OC, B*T, OC));
+    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUDA_R_32F, OC, 1, OC));
+
+    // create a preference handle with specified max workspace
+    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+
+    // find a suitable algorithm
+    cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
+        weightLayout, inputLayout, outputLayout, outputLayout,
+        preference, 1, &heuristic, &returnedResults));
+    if (returnedResults == 0) {
+        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d, gelu: %d\n", B, T, C, OC, has_bias);
+        exit(EXIT_FAILURE);
+    }
+
+    // call the matmul
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
+        &alpha, weight, weightLayout, inp, inputLayout, &beta,
+        out, outputLayout, out, outputLayout, &heuristic.algo,
+        cublaslt_workspace, cublaslt_workspace_size, 0));
+
+    // cleanups
+    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
+    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
+    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
+}
+
+
 void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                       float* inp,
-                       int B, int T, int C, int NH) {
-    const int block_size = 512;
+                        float* inp,
+                        int B, int T, int C, int NH) {
+    const int block_size = 256;
+    const int softmax_block_size = 256;
+
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
     int HS = C / NH; // head size
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
@@ -380,14 +524,14 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     const float alpha = 1.0f;
     const float beta = 0.0f;
     stat = cublasSgemmStridedBatched(handle,
-                            CUBLAS_OP_T, CUBLAS_OP_N,
-                            T, T, HS,
-                            &alpha,
-                            k, HS, T * HS,
-                            q, HS, T * HS,
-                            &beta,
-                            preatt, T, T * T,
-                            B * NH);
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     T, T, HS,
+                                     &alpha,
+                                     k, HS, T * HS,
+                                     q, HS, T * HS,
+                                     &beta,
+                                     preatt, T, T * T,
+                                     B * NH);
     if (stat != CUBLAS_STATUS_SUCCESS) {
         printf("cublasSgemm failed\n");
         exit(1);
@@ -395,27 +539,20 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
-    total_threads = B * NH * T * T;
-    num_blocks = CEIL_DIV(total_threads, block_size);
-    scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
-
-    // softmax. preatt is (B, NH, T, T) but we view it as (B * NH * T, T) and use the softmax kernel
-    int softmax_block_size = 256;
-    int grid_size = B * NH * T;
-    size_t shared_mem_size = 2 * softmax_block_size / 32 * sizeof(float);
-    softmax_forward_kernel4<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH * T, T);
+    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
+    softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     stat = cublasSgemmStridedBatched(handle,
-                            CUBLAS_OP_N, CUBLAS_OP_N,
-                            HS, T, T,
-                            &alpha,
-                            v, HS, T * HS,
-                            att, T, T * T,
-                            &beta,
-                            vaccum, HS, T * HS,
-                            B * NH);
+                                     CUBLAS_OP_N, CUBLAS_OP_N,
+                                     HS, T, T,
+                                     &alpha,
+                                     v, HS, T * HS,
+                                     att, T, T * T,
+                                     &beta,
+                                     vaccum, HS, T * HS,
+                                     B * NH);
     if (stat != CUBLAS_STATUS_SUCCESS) {
         printf("cublasSgemm failed\n");
         exit(1);
@@ -604,6 +741,7 @@ typedef struct {
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
+    float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
 } GPT2;
 
 
@@ -736,6 +874,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     } else {
         // validate B,T is no larger than what was previously allocated
         // in principle, we could re-allocate a larger chunk of memory, for now we just error out
@@ -798,20 +937,20 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_forward_cublas(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
     softmax_forward(acts.probs, acts.logits, B*T, V);
 
     // also forward the cross-entropy loss function if we have the targets
@@ -820,19 +959,59 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // for convenience also evaluate the mean loss
         // move the (B,T) losses to CPU
-        // TODO get rid of inline mallocs
-        float* cpu_losses = (float*)malloc(B * T * sizeof(float));
-        cudaCheck(cudaMemcpy(cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += cpu_losses[i]; }
+        for (int i=0; i<B*T; i++) { mean_loss += model->cpu_losses[i]; }
         mean_loss /= B*T;
         model->mean_loss = mean_loss;
-        free(cpu_losses);
 
     } else {
         // if we don't have targets, we don't have a loss
         model->mean_loss = -1.0f;
     }
+}
+
+void gpt2_zero_grad(GPT2 *model) {
+    if (model->grads_acts_memory != NULL) { cudaCheck(cudaMemset(model->grads_acts_memory, 0, model->num_activations * sizeof(float))); }
+    if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
+}
+
+void gpt2_backward(GPT2 *model) {
+
+    // double check we forwarded previously, with targets
+    if (model->mean_loss == -1.0f) {
+        printf("Error: must forward with targets before backward\n");
+        exit(1);
+    }
+
+    // lazily allocate the memory for gradients of the weights and activations, if needed
+    if (model->grads_memory == NULL) {
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
+        model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, model->act_sizes);
+        gpt2_zero_grad(model);
+    }
+
+    // convenience shortcuts
+    int B = model->batch_size;
+    int T = model->seq_len;
+    int V = model->config.vocab_size;
+    int L = model->config.num_layers;
+    int NH = model->config.num_heads;
+    int C = model->config.channels;
+
+    // backward pass: go in the reverse order of the forward pass, and call backward() functions
+    ParameterTensors params = model->params; // for brevity
+    ParameterTensors grads = model->grads;
+    ActivationTensors acts = model->acts;
+    ActivationTensors grads_acts = model->grads_acts;
+
+    // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
+    // technically this is a small, inline backward() pass of calculating
+    // total, final loss as the mean over all losses over all (B,T) positions in the batch
+    float dloss_mean = 1.0f / (B*T);
+    cudaCheck(cudaMemset(grads_acts.losses, dloss_mean, B*T * sizeof(float)));
+
+    // crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
 }
 
 void gpt2_free(GPT2 *model) {
@@ -844,6 +1023,7 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
+    cudaFreeHost(model->cpu_losses);
 }
 
 #ifndef TESTING
@@ -891,7 +1071,9 @@ void dataloader_init(DataLoader *loader, char* filename, int B, int T) {
     loader->current_position = 0; // start at the beginning
 
     // allocate space for B*T + 1 integers to store the inputs and targets
-    loader->batch = (int*) malloc((B * T + 1) * sizeof(int));
+    // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
+    // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
+    cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
     loader->num_batches = loader->file_size / (B * T * sizeof(int));
@@ -917,7 +1099,7 @@ void dataloader_next_batch(DataLoader *loader) {
 
 void dataloader_free(DataLoader *loader) {
     fclose(loader->tokens_file);
-    free(loader->batch);
+    cudaFreeHost(loader->batch);
 }
 
 
@@ -953,6 +1135,26 @@ int sample_mult(float* probabilities, int n, float coin) {
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
+
+    // set up the device
+    int deviceIdx = 0;
+    cudaCheck(cudaSetDevice(deviceIdx));
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    printf("[System]\n");
+    printf("Device %d: %s\n", deviceIdx, deviceProp.name);
+
+    // setup cuBLAS and cuBLASLt
+    cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasLtCreate(&cublaslt_handle));
+    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+    printf("enable_tf32: %d\n", enable_tf32);
+    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+    // setup the (global) cuBLASLt workspace
+    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
@@ -1009,7 +1211,8 @@ int main() {
                 // for each t, we re-compute all activations between 0 and t
                 // leaving this alone because you want separate code for inference anyway
                 // the inference here is just for sanity checking purposes
-                gpt2_forward(&model, gen_tokens, NULL, 1, t);
+                int t4 = (t + 3) & ~3; // clever way to round up to multiple of 4
+                gpt2_forward(&model, gen_tokens, NULL, 1, t4);
                 float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
                 float coin = random_f32(&rng_state);
                 // move probs back to CPU and sample
@@ -1028,7 +1231,6 @@ int main() {
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        // these are still TODO
         // gpt2_zero_grad(&model);
         // gpt2_backward(&model);
         // gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
@@ -1043,6 +1245,10 @@ int main() {
     dataloader_free(&val_loader);
     gpt2_free(&model);
     free(cpu_probs);
+    cudaCheck(cudaFree(cublaslt_workspace));
+    cublasCheck(cublasDestroy(cublas_handle));
+    cublasCheck(cublasLtDestroy(cublaslt_handle));
+
     return 0;
 }
 #endif
